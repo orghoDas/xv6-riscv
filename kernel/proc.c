@@ -6,6 +6,32 @@
 #include "proc.h"
 #include "defs.h"
 
+// --- Lottery Scheduler RNG ---
+
+unsigned long rand_next = 1;
+
+int
+do_rand(unsigned long *ctx)
+{
+  long hi, lo, x;
+
+  x = (*ctx % 0x7ffffffe) + 1;
+  hi = x / 127773;
+  lo = x % 127773;
+  x = 16807 * lo - 2836 * hi;
+  if(x < 0)
+    x += 0x7fffffff;
+  x--;
+  *ctx = x;
+  return (x);
+}
+
+int
+rand(void)
+{
+  return (do_rand(&rand_next));
+}
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -145,6 +171,9 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  p->tickets = 10;
+  p->rounds  = 0;
 
   return p;
 }
@@ -291,6 +320,7 @@ kfork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+  np->tickets = p->tickets;
 
   release(&np->lock);
 
@@ -438,20 +468,40 @@ scheduler(void)
     intr_off();
 
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    // --- Lottery Scheduler ---
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    // first pass: count total tickets of all RUNNABLE processes
+    int total_tickets = 0;
+
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state == RUNNABLE)
+        total_tickets += p->tickets;
+      release(&p->lock);
+    }
+
+    // no runnable processes, try again
+    if(total_tickets == 0)
+      continue;
+
+    // draw a winning ticket in range [0, total_tickets - 1]
+    int winner = rand() % total_tickets;
+    int counter = 0;
+
+    // second pass: find and run the winning process
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state == RUNNABLE){
+        counter += p->tickets;
+        if(counter > winner){
+          p->state = RUNNING;
+          c->proc = p;
+          p->rounds++;
+          swtch(&c->context, &p->context);
+          c->proc = 0;
+          release(&p->lock);
+          break;
+        }
       }
       release(&p->lock);
     }
@@ -684,7 +734,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printf("%d %s %s", p->pid, state, p->name);
+    printf("%d %s %s tickets=%d rounds=%d", p->pid, state, p->name, p->tickets, p->rounds);
     printf("\n");
   }
 }
